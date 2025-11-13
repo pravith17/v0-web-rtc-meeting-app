@@ -96,7 +96,7 @@ importers:
         specifier: latest
         version: 0.7.0(@supabase/supabase-js@2.81.1(bufferutil@4.0.9)(utf-8-validate@6.0.5))
       '@supabase/supabase-js':
-        specifier: 2.81.1
+        specifier: latest
         version: 2.81.1(bufferutil@4.0.9)(utf-8-validate@6.0.5)
       '@vercel/analytics':
         specifier: latest
