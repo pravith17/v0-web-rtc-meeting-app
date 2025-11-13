@@ -139,7 +139,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
             if (presence.user_id !== user.id) {
               if (!peersRef.current.has(presence.user_id)) {
                 console.log("[v0] Creating peer connection for:", presence.user_id)
-                createPeerConnection(presence.user_id, presence.username, false)
+                createPeerConnection(presence.user_id, presence.username)
               }
             }
           })
@@ -150,7 +150,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
           if (newUser.user_id !== user.id) {
             console.log("[v0] New user joined:", newUser.user_id)
             if (!peersRef.current.has(newUser.user_id)) {
-              createPeerConnection(newUser.user_id, newUser.username, false)
+              createPeerConnection(newUser.user_id, newUser.username)
             }
           }
         })
@@ -233,10 +233,18 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     })
 
     if (localStreamRef.current) {
-      console.log("[v0] Adding local tracks to peer:", peerId)
+      console.log(
+        "[v0] Adding local tracks to peer:",
+        peerId,
+        "Track count:",
+        localStreamRef.current.getTracks().length,
+      )
       localStreamRef.current.getTracks().forEach((track) => {
+        console.log("[v0] Adding track:", track.kind, "enabled:", track.enabled)
         peerConnection.addTrack(track, localStreamRef.current!)
       })
+    } else {
+      console.error("[v0] No local stream available when creating peer connection!")
     }
 
     peerConnection.onicecandidate = async (event) => {
@@ -255,12 +263,20 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     }
 
     peerConnection.ontrack = (event) => {
-      console.log("[v0] Received remote track:", event.track.kind, "from:", peerId)
+      console.log("[v0] Received remote track:", event.track.kind, "from:", peerId, "streams:", event.streams.length)
       const remoteStream = event.streams[0]
       if (!remoteStream) {
-        console.error("[v0] No remote stream in track event")
+        console.error("[v0] No remote stream in track event!")
         return
       }
+
+      console.log(
+        "[v0] Remote stream tracks:",
+        remoteStream
+          .getTracks()
+          .map((t) => `${t.kind}(${t.enabled})`)
+          .join(","),
+      )
 
       if (event.track.kind === "audio") {
         if (audioContextRef.current) {
@@ -281,8 +297,10 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
         if (existingIndex >= 0) {
           const updated = [...prev]
           updated[existingIndex] = { ...updated[existingIndex], stream: remoteStream, username: peerUsername }
+          console.log("[v0] Updated existing remote stream for:", peerId)
           return updated
         }
+        console.log("[v0] Added new remote stream for:", peerId)
         return [...prev, { id: peerId, stream: remoteStream, username: peerUsername }]
       })
     }
