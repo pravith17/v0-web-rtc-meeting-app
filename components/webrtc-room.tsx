@@ -12,6 +12,7 @@ const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stu
 interface RemotePeer {
   peerConnection: RTCPeerConnection
   username?: string
+  hasReceivedOffer?: boolean
 }
 
 interface RemoteStream {
@@ -42,6 +43,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
   const screenStreamRef = useRef<MediaStream | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyzerRefs = useRef<Record<string, AnalyserNode>>({})
+  const connectionAttemptsRef = useRef<Record<string, number>>({})
 
   const router = useRouter()
   const supabase = createClient()
@@ -95,12 +97,13 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
         }
 
         userIdRef.current = user.id
+        console.log("[v0] User ID:", user.id)
 
         let stream: MediaStream | null = null
         try {
           stream = await getMediaStream()
         } catch (mediaErr) {
-          console.error("Failed to get media stream:", mediaErr)
+          console.error("[v0] Failed to get media stream:", mediaErr)
           return
         }
 
@@ -111,6 +114,10 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
 
         localStreamRef.current = stream
         setLocalStream(stream)
+        console.log(
+          "[v0] Local stream ready with tracks:",
+          stream.getTracks().map((t) => t.kind),
+        )
 
         const channel = supabase.channel(`meeting:${meetingCode}`, {
           config: {
@@ -125,12 +132,14 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
 
           const presenceState = channel.presenceState()
           const presentUsers = Object.values(presenceState).flat()
+          console.log("[v0] Present users:", presentUsers.length)
 
-          // Create peer connections for all present users
+          // Create peer connections for all other users
           presentUsers.forEach((presence: any) => {
             if (presence.user_id !== user.id) {
               if (!peersRef.current.has(presence.user_id)) {
-                createPeerConnection(presence.user_id, presence.username, true)
+                console.log("[v0] Creating peer connection for:", presence.user_id)
+                createPeerConnection(presence.user_id, presence.username, false)
               }
             }
           })
@@ -139,11 +148,15 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
         channel.on("presence", { event: "join" }, ({ key, newPresences }) => {
           const newUser = newPresences[0]
           if (newUser.user_id !== user.id) {
-            createPeerConnection(newUser.user_id, newUser.username, true)
+            console.log("[v0] New user joined:", newUser.user_id)
+            if (!peersRef.current.has(newUser.user_id)) {
+              createPeerConnection(newUser.user_id, newUser.username, false)
+            }
           }
         })
 
         channel.on("presence", { event: "leave" }, ({ key }) => {
+          console.log("[v0] User left:", key)
           const peerConnection = peersRef.current.get(key)?.peerConnection
           if (peerConnection) {
             peerConnection.close()
@@ -153,21 +166,23 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
           delete analyzerRefs.current[key]
         })
 
-        // Handle signaling messages
         channel.on("broadcast", { event: "offer" }, ({ payload }) => {
-          if (payload.to === user.id || !payload.to) {
+          console.log("[v0] Received offer from:", payload.from, "to:", payload.to, "my ID:", userIdRef.current)
+          if (payload.from !== userIdRef.current) {
             handleOffer(payload.from, payload.offer, payload.fromUsername)
           }
         })
 
         channel.on("broadcast", { event: "answer" }, ({ payload }) => {
-          if (payload.to === user.id || !payload.to) {
+          console.log("[v0] Received answer from:", payload.from, "to:", payload.to, "my ID:", userIdRef.current)
+          if (payload.from !== userIdRef.current) {
             handleAnswer(payload.from, payload.answer)
           }
         })
 
         channel.on("broadcast", { event: "ice-candidate" }, ({ payload }) => {
-          if (payload.to === user.id || !payload.to) {
+          console.log("[v0] Received ICE candidate from:", payload.from)
+          if (payload.from !== userIdRef.current) {
             handleIceCandidate(payload.from, payload.candidate)
           }
         })
@@ -176,9 +191,19 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
           if (status === "SUBSCRIBED") {
             console.log("[v0] Subscribed to meeting channel")
             await channel.track({
-              user_id: user.id,
+              user_id: userIdRef.current,
               username: username,
             })
+
+            setTimeout(() => {
+              const presenceState = channel.presenceState()
+              const presentUsers = Object.values(presenceState).flat()
+              presentUsers.forEach((presence: any) => {
+                if (presence.user_id !== userIdRef.current && peersRef.current.has(presence.user_id)) {
+                  sendOfferToPeer(presence.user_id)
+                }
+              })
+            }, 500)
           }
         })
 
@@ -186,7 +211,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
       } catch (err) {
         const message = err instanceof Error ? err.message : "Failed to initialize call"
         setError(message)
-        console.error("Error initializing call:", err)
+        console.error("[v0] Error initializing call:", err)
       }
     }
 
@@ -197,16 +222,18 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     }
   }, [meetingCode, username, router, supabase])
 
-  const createPeerConnection = async (peerId: string, peerUsername?: string, initiator?: boolean) => {
+  const createPeerConnection = async (peerId: string, peerUsername?: string) => {
     if (peersRef.current.has(peerId)) {
       return
     }
 
+    console.log("[v0] Creating peer connection for:", peerId)
     const peerConnection = new RTCPeerConnection({
       iceServers: ICE_SERVERS,
     })
 
     if (localStreamRef.current) {
+      console.log("[v0] Adding local tracks to peer:", peerId)
       localStreamRef.current.getTracks().forEach((track) => {
         peerConnection.addTrack(track, localStreamRef.current!)
       })
@@ -214,6 +241,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
 
     peerConnection.onicecandidate = async (event) => {
       if (event.candidate && channelRef.current) {
+        console.log("[v0] Sending ICE candidate to:", peerId)
         channelRef.current.send({
           type: "broadcast",
           event: "ice-candidate",
@@ -227,9 +255,12 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     }
 
     peerConnection.ontrack = (event) => {
-      console.log("[v0] Received remote track:", event.track.kind)
+      console.log("[v0] Received remote track:", event.track.kind, "from:", peerId)
       const remoteStream = event.streams[0]
-      if (!remoteStream) return
+      if (!remoteStream) {
+        console.error("[v0] No remote stream in track event")
+        return
+      }
 
       if (event.track.kind === "audio") {
         if (audioContextRef.current) {
@@ -240,7 +271,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
             source.connect(analyser)
             analyzerRefs.current[peerId] = analyser
           } catch (err) {
-            console.error("Error setting up speaker detection:", err)
+            console.error("[v0] Error setting up speaker detection:", err)
           }
         }
       }
@@ -257,7 +288,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     }
 
     peerConnection.onconnectionstatechange = () => {
-      console.log("[v0] Peer connection state:", peerConnection.connectionState)
+      console.log("[v0] Peer connection state:", peerConnection.connectionState, "peer:", peerId)
       if (peerConnection.connectionState === "failed" || peerConnection.connectionState === "closed") {
         peersRef.current.delete(peerId)
         setRemoteStreams((prev) => prev.filter((s) => s.id !== peerId))
@@ -265,31 +296,36 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
       }
     }
 
-    peersRef.current.set(peerId, { peerConnection, username: peerUsername })
+    peersRef.current.set(peerId, { peerConnection, username: peerUsername, hasReceivedOffer: false })
+  }
 
-    if (initiator && localStreamRef.current) {
-      try {
-        const offer = await peerConnection.createOffer()
-        await peerConnection.setLocalDescription(offer)
-        if (channelRef.current) {
-          channelRef.current.send({
-            type: "broadcast",
-            event: "offer",
-            payload: {
-              from: userIdRef.current,
-              to: peerId,
-              fromUsername: username,
-              offer,
-            },
-          })
-        }
-      } catch (err) {
-        console.error("Error creating offer:", err)
+  const sendOfferToPeer = async (peerId: string) => {
+    const peerData = peersRef.current.get(peerId)
+    if (!peerData) return
+
+    try {
+      console.log("[v0] Creating and sending offer to:", peerId)
+      const offer = await peerData.peerConnection.createOffer()
+      await peerData.peerConnection.setLocalDescription(offer)
+      if (channelRef.current) {
+        channelRef.current.send({
+          type: "broadcast",
+          event: "offer",
+          payload: {
+            from: userIdRef.current,
+            to: peerId,
+            fromUsername: username,
+            offer,
+          },
+        })
       }
+    } catch (err) {
+      console.error("[v0] Error creating/sending offer:", err)
     }
   }
 
   const handleOffer = async (peerId: string, offer: RTCSessionDescriptionInit, fromUsername?: string) => {
+    console.log("[v0] Handling offer from:", peerId)
     const {
       data: { user },
     } = await supabase.auth.getUser()
@@ -298,74 +334,17 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     let peerConnection = peersRef.current.get(peerId)?.peerConnection
 
     if (!peerConnection) {
-      peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS })
-
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          peerConnection!.addTrack(track, localStreamRef.current!)
-        })
-      }
-
-      peerConnection.onicecandidate = async (event) => {
-        if (event.candidate && channelRef.current) {
-          channelRef.current.send({
-            type: "broadcast",
-            event: "ice-candidate",
-            payload: {
-              from: userIdRef.current,
-              to: peerId,
-              candidate: event.candidate,
-            },
-          })
-        }
-      }
-
-      peerConnection.ontrack = (event) => {
-        console.log("[v0] Received remote track:", event.track.kind)
-        const remoteStream = event.streams[0]
-        if (!remoteStream) return
-
-        if (event.track.kind === "audio") {
-          if (audioContextRef.current) {
-            try {
-              const source = audioContextRef.current.createMediaStreamSource(remoteStream)
-              const analyser = audioContextRef.current.createAnalyser()
-              analyser.fftSize = 256
-              source.connect(analyser)
-              analyzerRefs.current[peerId] = analyser
-            } catch (err) {
-              console.error("Error setting up speaker detection:", err)
-            }
-          }
-        }
-
-        setRemoteStreams((prev) => {
-          const existingIndex = prev.findIndex((s) => s.id === peerId)
-          if (existingIndex >= 0) {
-            const updated = [...prev]
-            updated[existingIndex] = { ...updated[existingIndex], stream: remoteStream, username: fromUsername }
-            return updated
-          }
-          return [...prev, { id: peerId, stream: remoteStream, username: fromUsername }]
-        })
-      }
-
-      peerConnection.onconnectionstatechange = () => {
-        console.log("[v0] Peer connection state:", peerConnection.connectionState)
-        if (peerConnection.connectionState === "failed" || peerConnection.connectionState === "closed") {
-          peersRef.current.delete(peerId)
-          setRemoteStreams((prev) => prev.filter((s) => s.id !== peerId))
-          delete analyzerRefs.current[peerId]
-        }
-      }
-
-      peersRef.current.set(peerId, { peerConnection, username: fromUsername })
+      console.log("[v0] Peer connection not found, creating new one for:", peerId)
+      await createPeerConnection(peerId, fromUsername)
+      peerConnection = peersRef.current.get(peerId)?.peerConnection
+      if (!peerConnection) return
     }
 
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
       const answer = await peerConnection.createAnswer()
       await peerConnection.setLocalDescription(answer)
+      console.log("[v0] Sending answer to:", peerId)
       if (channelRef.current) {
         channelRef.current.send({
           type: "broadcast",
@@ -377,19 +356,21 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
           },
         })
       }
+      peersRef.current.get(peerId)!.hasReceivedOffer = true
     } catch (err) {
-      console.error("Error handling offer:", err)
+      console.error("[v0] Error handling offer:", err)
     }
   }
 
   const handleAnswer = async (peerId: string, answer: RTCSessionDescriptionInit) => {
+    console.log("[v0] Handling answer from:", peerId)
     const peerConnection = peersRef.current.get(peerId)?.peerConnection
     if (peerConnection) {
       try {
-        console.log("[v0] Setting remote description from answer")
         await peerConnection.setRemoteDescription(new RTCSessionDescription(answer))
+        console.log("[v0] Remote description set from answer")
       } catch (err) {
-        console.error("Error handling answer:", err)
+        console.error("[v0] Error handling answer:", err)
       }
     }
   }
@@ -398,10 +379,9 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     const peerConnection = peersRef.current.get(peerId)?.peerConnection
     if (peerConnection) {
       try {
-        console.log("[v0] Adding ICE candidate")
         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
       } catch (err) {
-        console.error("Error adding ICE candidate:", err)
+        console.error("[v0] Error adding ICE candidate:", err)
       }
     }
   }
