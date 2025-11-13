@@ -3,10 +3,9 @@
 interface ConnectionStatusProps {
   signalingConnected: boolean
   remoteCount: number
-  signalingServerUrl?: string
 }
 
-export function ConnectionStatus({ signalingConnected, remoteCount, signalingServerUrl }: ConnectionStatusProps) {
+export function ConnectionStatus({ signalingConnected, remoteCount }: ConnectionStatusProps) {
   return (
     <div className="fixed bottom-4 left-4 bg-gray-900 text-white px-4 py-2 rounded-lg text-xs font-mono z-50 max-w-xs">
       <div className="flex flex-col gap-2">
@@ -17,14 +16,7 @@ export function ConnectionStatus({ signalingConnected, remoteCount, signalingSer
           </span>
         </div>
         <div>Remotes: {remoteCount}</div>
-        <div className="text-gray-400 break-words">
-          {signalingServerUrl ? signalingServerUrl : "⚠️ No signaling URL set"}
-        </div>
-        {!signalingConnected && (
-          <div className="text-yellow-400 text-xs mt-1">
-            Check if env var NEXT_PUBLIC_SIGNALING_SERVER_URL is set in Vercel
-          </div>
-        )}
+        {!signalingConnected && <div className="text-yellow-400 text-xs mt-1">Connecting to signaling server...</div>}
       </div>
     </div>
   )

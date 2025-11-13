@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { createClient } from "@/lib/supabase/client"
 import { VideoGrid } from "./video-grid"
-import { io, type Socket } from "socket.io-client"
 import { ConnectionStatus } from "./connection-status"
 
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }]
@@ -35,7 +34,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
   const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null)
   const [signalingConnected, setSignalingConnected] = useState(false)
 
-  const socketRef = useRef<Socket | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
   const peersRef = useRef<Map<string, RemotePeer>>(new Map())
   const localStreamRef = useRef<MediaStream | null>(null)
   const userIdRef = useRef<string>("")
@@ -118,91 +117,65 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
         localStreamRef.current = stream
         setLocalStream(stream)
 
-        const signalingUrl = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL || "http://localhost:5000"
-        console.log(`[v0] Connecting to signaling server at ${signalingUrl}`)
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+        const wsUrl = `${protocol}//${window.location.host}/api/webrtc?meeting=${meetingCode}&userId=${user.id}&username=${encodeURIComponent(username)}`
 
-        const socket = io(signalingUrl, {
-          reconnection: true,
-          reconnectionDelay: 1000,
-          reconnectionDelayMax: 5000,
-          reconnectionAttempts: 5,
-        })
+        console.log(`[v0] Connecting to WebSocket at ${wsUrl}`)
+        const ws = new WebSocket(wsUrl)
 
-        socketRef.current = socket
-
-        socket.on("connect", () => {
-          console.log("[v0] Connected to signaling server")
+        ws.onopen = () => {
+          console.log("[v0] Connected to WebSocket signaling server")
           setSignalingConnected(true)
-          socket.emit(
-            "join-meeting",
-            {
-              meetingCode,
-              userId: user.id,
-              username,
-            },
-            (response: any) => {
-              if (response.success) {
-                console.log(`[v0] Joined meeting ${meetingCode}`)
-                console.log(`[v0] Initial participants: ${response.participants.length}`)
-                response.participants.forEach((participant: any) => {
-                  if (participant.userId !== user.id) {
-                    createPeerConnection(participant.userId, participant.username, true)
-                  }
-                })
-              } else {
-                console.error("[v0] Failed to join meeting:", response.error)
+        }
+
+        ws.onmessage = async (event) => {
+          const message = JSON.parse(event.data)
+          console.log(`[v0] Received message type: ${message.type}`)
+
+          if (message.type === "join-response") {
+            console.log(`[v0] Initial participants: ${message.participants.length}`)
+            message.participants.forEach((participant: any) => {
+              if (participant.userId !== user.id) {
+                createPeerConnection(participant.userId, participant.username, true)
               }
-            },
-          )
-        })
-
-        socket.on("user-joined", (data: any) => {
-          console.log(`[v0] User ${data.username} joined`)
-          createPeerConnection(data.userId, data.username, true)
-        })
-
-        socket.on("offer", async (data: any) => {
-          console.log(`[v0] Received offer from ${data.from}`)
-          if (data.from) {
-            await handleOffer(data.from, data.offer, data.fromUsername)
+            })
+          } else if (message.type === "user-joined") {
+            console.log(`[v0] User ${message.username} joined`)
+            createPeerConnection(message.userId, message.username, true)
+          } else if (message.type === "offer") {
+            console.log(`[v0] Received offer from ${message.from}`)
+            await handleOffer(message.from, message.offer, message.fromUsername)
+          } else if (message.type === "answer") {
+            console.log(`[v0] Received answer from ${message.from}`)
+            await handleAnswer(message.from, message.answer)
+          } else if (message.type === "ice-candidate") {
+            console.log(`[v0] Received ICE candidate from ${message.from}`)
+            await handleIceCandidate(message.from, message.candidate)
+          } else if (message.type === "user-left") {
+            console.log(`[v0] User ${message.username} left`)
+            const peerConnection = peersRef.current.get(message.userId)?.peerConnection
+            if (peerConnection) {
+              peerConnection.close()
+            }
+            peersRef.current.delete(message.userId)
+            setRemoteStreams((prev) => prev.filter((s) => s.id !== message.userId))
+            delete analyzerRefs.current[message.userId]
           }
-        })
+        }
 
-        socket.on("answer", async (data: any) => {
-          console.log(`[v0] Received answer from ${data.from}`)
-          if (data.from) {
-            await handleAnswer(data.from, data.answer)
-          }
-        })
-
-        socket.on("ice-candidate", async (data: any) => {
-          console.log(`[v0] Received ICE candidate from ${data.from}`)
-          if (data.from) {
-            await handleIceCandidate(data.from, data.candidate)
-          }
-        })
-
-        socket.on("user-left", (data: any) => {
-          console.log(`[v0] User ${data.username} left`)
-          const peerConnection = peersRef.current.get(data.userId)?.peerConnection
-          if (peerConnection) {
-            peerConnection.close()
-          }
-          peersRef.current.delete(data.userId)
-          setRemoteStreams((prev) => prev.filter((s) => s.id !== data.userId))
-          delete analyzerRefs.current[data.userId]
-        })
-
-        socket.on("disconnect", () => {
-          console.log("[v0] Disconnected from signaling server")
+        ws.onerror = (error) => {
+          console.error("[v0] WebSocket error:", error)
+          setError("Connection error. Please check your internet connection.")
           setSignalingConnected(false)
-          setError("Disconnected from server. Reconnecting...")
-        })
+        }
 
-        socket.on("error", (error: any) => {
-          console.error("[v0] Socket error:", error)
-          setError(`Connection error: ${error}`)
-        })
+        ws.onclose = () => {
+          console.log("[v0] WebSocket disconnected")
+          setSignalingConnected(false)
+          setError("Disconnected from meeting. Please refresh to reconnect.")
+        }
+
+        wsRef.current = ws
       } catch (err) {
         const message = err instanceof Error ? err.message : "Failed to initialize call"
         setError(message)
@@ -239,14 +212,16 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     }
 
     peerConnection.onicecandidate = async (event) => {
-      if (event.candidate && socketRef.current) {
+      if (event.candidate && wsRef.current) {
         console.log(`[v0] Sending ICE candidate to ${peerId}`)
-        socketRef.current.emit("ice-candidate", {
-          meetingCode,
-          from: userIdRef.current,
-          to: peerId,
-          candidate: event.candidate,
-        })
+        wsRef.current.send(
+          JSON.stringify({
+            type: "ice-candidate",
+            from: userIdRef.current,
+            to: peerId,
+            candidate: event.candidate,
+          }),
+        )
       }
     }
 
@@ -302,14 +277,16 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
         console.log(`[v0] Creating offer for peer ${peerId}`)
         const offer = await peerConnection.createOffer()
         await peerConnection.setLocalDescription(offer)
-        if (socketRef.current) {
-          socketRef.current.emit("offer", {
-            meetingCode,
-            from: userIdRef.current,
-            to: peerId,
-            fromUsername: username,
-            offer,
-          })
+        if (wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "offer",
+              from: userIdRef.current,
+              to: peerId,
+              fromUsername: username,
+              offer,
+            }),
+          )
         }
         console.log(`[v0] Sent offer to ${peerId}`)
       } catch (err) {
@@ -334,13 +311,15 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
       }
 
       peerConnection.onicecandidate = async (event) => {
-        if (event.candidate && socketRef.current) {
-          socketRef.current.emit("ice-candidate", {
-            meetingCode,
-            from: userIdRef.current,
-            to: peerId,
-            candidate: event.candidate,
-          })
+        if (event.candidate && wsRef.current) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "ice-candidate",
+              from: userIdRef.current,
+              to: peerId,
+              candidate: event.candidate,
+            }),
+          )
         }
       }
 
@@ -395,14 +374,16 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
       const answer = await peerConnection.createAnswer()
       await peerConnection.setLocalDescription(answer)
       console.log(`[v0] Sending answer to ${peerId}`)
-      if (socketRef.current) {
-        socketRef.current.emit("answer", {
-          meetingCode,
-          from: userIdRef.current,
-          to: peerId,
-          fromUsername: username,
-          answer,
-        })
+      if (wsRef.current) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: "answer",
+            from: userIdRef.current,
+            to: peerId,
+            fromUsername: username,
+            answer,
+          }),
+        )
       }
     } catch (err) {
       console.error(`[v0] Error handling offer from ${peerId}:`, err)
@@ -529,13 +510,8 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
     })
     peersRef.current.clear()
 
-    if (socketRef.current) {
-      socketRef.current.emit("leave-meeting", {
-        meetingCode,
-        userId: userIdRef.current,
-        username,
-      })
-      socketRef.current.disconnect()
+    if (wsRef.current) {
+      wsRef.current.close()
     }
 
     if (audioContextRef.current) {
@@ -599,8 +575,8 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
       })
       peersRef.current.clear()
 
-      if (socketRef.current) {
-        socketRef.current.disconnect()
+      if (wsRef.current) {
+        wsRef.current.close()
       }
 
       if (audioContextRef.current) {
@@ -611,11 +587,7 @@ export function WebRTCRoom({ meetingCode, username }: WebRTCRoomProps) {
 
   return (
     <>
-      <ConnectionStatus
-        signalingConnected={signalingConnected}
-        remoteCount={remoteStreams.length}
-        signalingServerUrl={process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL}
-      />
+      <ConnectionStatus signalingConnected={signalingConnected} remoteCount={remoteStreams.length} />
       <VideoGrid
         localStream={localStream}
         remoteStreams={remoteStreams}
